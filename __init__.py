@@ -20,12 +20,171 @@ bl_info = {
     "category": "Create"}
 
 
+import math
+
 import bpy
 from bpy.types import Panel,Operator,PropertyGroup
-from bpy.props import EnumProperty
+from bpy.props import EnumProperty, FloatProperty, BoolProperty, IntProperty
+from mathutils import Vector, Euler
 
 # Third party application
 from . import addon_updater_ops
+
+
+# Rotation presets (radians) for the camera-generating branches of
+# PR_OT_createisocams.execute(), also used to preview the tile grid before
+# any camera object exists in the scene.
+ISOCAM_ROTATIONS = {
+    "ITEM_1": (0.955324, 0, 0.785398),  # TrueIsoCam
+    "ITEM_2": (1.047198, 0, 0.785398),  # GameIsoCam
+    "ITEM_3": (0.724312, 0, 0.785398),  # GameIso4to3Cam
+}
+
+_REFERENCE_TILE_CORNERS = [Vector((0, 0, 0)), Vector((1, 0, 0)),
+                           Vector((1, 1, 0)), Vector((0, 1, 0))]
+
+
+def _view_axes(rotation_euler):
+    """right/up/forward world-space unit vectors for a camera rotation,
+    independent of any actual camera object."""
+    basis = Euler(rotation_euler).to_matrix()
+    right = (basis @ Vector((1, 0, 0))).normalized()
+    up = (basis @ Vector((0, 1, 0))).normalized()
+    forward = (basis @ Vector((0, 0, -1))).normalized()
+    return right, up, forward
+
+
+def _tile_world_size(rotation_euler, units_per_pixel, base_tile_width_px):
+    """World-unit side length of a square footprint that renders base_tile_width_px wide."""
+    right, _, _ = _view_axes(rotation_euler)
+    xs = [c.dot(right) for c in _REFERENCE_TILE_CORNERS]
+    width_per_unit = max(xs) - min(xs)
+    return (base_tile_width_px * units_per_pixel) / width_per_unit
+
+
+def _tile_height_px(rotation_euler, units_per_pixel, base_tile_width_px):
+    """Read-only preview: pixel height of a single flat tile at this camera angle."""
+    _, up, _ = _view_axes(rotation_euler)
+    ys = [c.dot(up) for c in _REFERENCE_TILE_CORNERS]
+    height_per_unit = max(ys) - min(ys)
+    tile_size = _tile_world_size(rotation_euler, units_per_pixel, base_tile_width_px)
+    return round(tile_size * height_per_unit / units_per_pixel)
+
+
+def _bounds_along_axes(objects, right, up, forward):
+    """Return (center, width, height, depth) of objects' combined bounding
+    box, expressed along the given right/up/forward axes."""
+    corners = []
+    for obj in objects:
+        if obj.type in {'CAMERA', 'LIGHT'} or not hasattr(obj, "bound_box"):
+            continue
+        corners.extend(obj.matrix_world @ Vector(corner) for corner in obj.bound_box)
+    if not corners:
+        return None
+
+    xs = [c.dot(right) for c in corners]
+    ys = [c.dot(up) for c in corners]
+    zs = [c.dot(forward) for c in corners]
+
+    width = max(xs) - min(xs)
+    height = max(ys) - min(ys)
+    depth = max(zs) - min(zs)
+    center = (right * (max(xs) + min(xs)) / 2
+              + up * (max(ys) + min(ys)) / 2
+              + forward * (max(zs) + min(zs)) / 2)
+    return center, width, height, depth
+
+
+def _current_rotation(context):
+    """Rotation to measure/frame against: the actual scene camera if one
+    exists, else the currently-selected camera preset (lets calibration and
+    the tile-height preview work before GENERATE has ever been pressed)."""
+    camera = context.scene.camera
+    if camera is not None:
+        return camera.rotation_euler
+    return ISOCAM_ROTATIONS.get(context.scene.custom_isocam.list_isocam)
+
+
+def _selection_bounds_in_view(camera, objects):
+    """Same as _bounds_along_axes, but derives axes from a live camera
+    object, and also returns forward/up (frame_camera_on_objects needs
+    forward to place the camera and up to anchor tile-snapped height)."""
+    basis = camera.matrix_world.to_3x3()
+    right = (basis @ Vector((1, 0, 0))).normalized()
+    up = (basis @ Vector((0, 1, 0))).normalized()
+    forward = (basis @ Vector((0, 0, -1))).normalized()
+
+    bounds = _bounds_along_axes(objects, right, up, forward)
+    if bounds is None:
+        return None
+    center, width, height, depth = bounds
+    return center, width, height, depth, forward, up
+
+
+def frame_camera_on_objects(camera, objects, units_per_pixel, use_tile_grid=False,
+                             base_tile_width_px=64, margin=1.05):
+    """Center camera on objects and set render resolution so that
+    units_per_pixel Blender units always equal one output pixel.
+
+    When use_tile_grid is True, both the render width and height are
+    snapped up to the next whole multiple of one tile's *projected* size
+    (base_tile_width_px/tile_height_px * units_per_pixel, already in the
+    same axis-projected world units that _selection_bounds_in_view
+    returns) instead of tightly fitting the selection, so that assets with
+    matching footprints render at compatible sizes and the footprint is
+    never larger than the canvas. Width stays centered on the selection;
+    height snaps upward only, anchoring the object's bottom edge to the
+    bottom row of the frame so multiple different-height tiles share one
+    ground line.
+    """
+    bounds = _selection_bounds_in_view(camera, objects)
+    if bounds is None:
+        return False
+    center, width, height, depth, forward, up = bounds
+
+    if use_tile_grid:
+        tile_width_units = base_tile_width_px * units_per_pixel
+        # Ceiling, not nearest: the snapped canvas must never be narrower
+        # than the actual footprint, or the object clips left/right.
+        tiles_wide = max(1, math.ceil(width / tile_width_units))
+        new_width = tiles_wide * tile_width_units
+        resolution_x = tiles_wide * base_tile_width_px
+
+        tile_height_px = _tile_height_px(camera.rotation_euler, units_per_pixel, base_tile_width_px)
+        tile_height_units = tile_height_px * units_per_pixel
+        tiles_tall = max(1, math.ceil(height / tile_height_units))
+        new_height = tiles_tall * tile_height_units
+        resolution_y = tiles_tall * tile_height_px
+
+        # All headroom added by the vertical snap goes above the object,
+        # none below: shift the frame center up by half the added height.
+        center = center + up * ((new_height - height) / 2)
+        width, height = new_width, new_height
+    else:
+        width *= margin
+        height *= margin
+        resolution_x = max(1, round(width / units_per_pixel))
+        resolution_y = max(1, round(height / units_per_pixel))
+
+    distance = depth / 2 + max(width, height, 1.0)
+    camera.location = center - forward * distance
+    camera.data.clip_end = max(camera.data.clip_end, distance + depth + max(width, height))
+
+    # Set HORIZONTAL/VERTICAL explicitly rather than relying on AUTO's
+    # (unverified) tie-breaking between resolution_x and resolution_y.
+    if width >= height:
+        camera.data.sensor_fit = 'HORIZONTAL'
+        camera.data.ortho_scale = width
+    else:
+        camera.data.sensor_fit = 'VERTICAL'
+        camera.data.ortho_scale = height
+
+    render = bpy.context.scene.render
+    render.resolution_x = resolution_x
+    render.resolution_y = resolution_y
+    render.pixel_aspect_x = 1.0
+    render.pixel_aspect_y = 1.0
+    return True
 
 
 class PR_GT_listofisocam(PropertyGroup):
@@ -38,11 +197,33 @@ class PR_GT_listofisocam(PropertyGroup):
         ("ITEM_3", "GameIsoTo3Cam",""),
         ("ITEM_4", "GroundPlane", "")
         ])
+    pixel_density: FloatProperty(
+        name="Units per Pixel",
+        description="Blender units represented by one output pixel when framing a selection",
+        default=0.01,
+        min=0.0001,
+        subtype='DISTANCE',
+        unit='LENGTH',
+        )
+    use_tile_grid: BoolProperty(
+        name="Enable Tile Grid",
+        description="Snap framed render width to whole multiples of Base Tile Width, "
+                     "so assets sharing a footprint render at compatible widths",
+        default=False,
+        )
+    base_tile_width_px: IntProperty(
+        name="Base Tile Width (px)",
+        description="Pixel width of one tile footprint; height is derived from the "
+                     "active camera preset's fixed isometric angle",
+        default=64,
+        min=1,
+        )
 
 class PR_OT_createisocams(Operator):
     """Creates a camera on 4 different isometric views"""
     bl_label = "GENERATE"
     bl_idname = "scene.create_isocams"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
@@ -51,6 +232,9 @@ class PR_OT_createisocams(Operator):
     def execute(self,context):
         scene = context.scene
         custom_isocam_property = scene.custom_isocam
+        # Captured before any camera-add operator runs, since those change selection.
+        target_objects = [obj for obj in context.selected_objects
+                           if obj.type not in {'CAMERA', 'LIGHT'}]
 
         if custom_isocam_property.list_isocam == "ITEM_1":
             # ----------------------------Create Camera with correct position and rotation
@@ -66,6 +250,10 @@ class PR_OT_createisocams(Operator):
             object.data.ortho_scale = 14.123 # Let's fit the camera to a basetile in size of 10
             object.name = "TrueIsoCam" # let's rename the cam so that it cannot be confused with other cameras.
             bpy.ops.view3d.object_as_camera() # Set the current camera as the active one to look through
+            if target_objects:
+                frame_camera_on_objects(object, target_objects, custom_isocam_property.pixel_density,
+                                        custom_isocam_property.use_tile_grid,
+                                        custom_isocam_property.base_tile_width_px)
         elif custom_isocam_property.list_isocam == "ITEM_2":
             view_layer = bpy.context.view_layer
             # ----------------------------Create Camera with correct position and rotation
@@ -79,12 +267,16 @@ class PR_OT_createisocams(Operator):
             camera.location = (30.60861, -30.60861, 25.00000)
             camera.rotation_euler=(1.047198, 0, 0.785398) #Attention, these are radians. Euler angles are (60,0,45) Here we set the rotation for a isometric view that is used in 2D games. Not to mix with the mathematical correct Isoview!
 
-            # Create Camera. I would love to set the rotation here too. Blender not. Not that there are no tutorials around which shows that it should work ... .
-
-            #So that's what the next two lines are good for. Setting the rotation of the camera ...
-
-             # let's rename the cam so that it cannot be confused with other cameras.
+            # object_as_camera() acts on the active object, which linking alone does not set.
+            for obj in view_layer.objects:
+                obj.select_set(False)
+            camera.select_set(True)
+            view_layer.objects.active = camera
             bpy.ops.view3d.object_as_camera() # Set the current camera as the active one to look through
+            if target_objects:
+                frame_camera_on_objects(camera, target_objects, custom_isocam_property.pixel_density,
+                                        custom_isocam_property.use_tile_grid,
+                                        custom_isocam_property.base_tile_width_px)
         elif custom_isocam_property.list_isocam == "ITEM_3":
             # ----------------------------Create Camera with correct position and rotation
             bpy.ops.object.camera_add(location=(23.42714, -23.42714, 37.4478)) # Create Camera. I would love to set the rotation here too. Blender not. Not that there are no tutorials around which shows that it should work ... .
@@ -99,6 +291,10 @@ class PR_OT_createisocams(Operator):
             object.data.ortho_scale = 14.123  # Let's fit the camera to our basetile in size of 10
             object.name = "GameIso4to3Cam" # let's rename the cam so that it cannot be confused with other cameras.
             bpy.ops.view3d.object_as_camera() # Set the current camera as the active one to look through
+            if target_objects:
+                frame_camera_on_objects(object, target_objects, custom_isocam_property.pixel_density,
+                                        custom_isocam_property.use_tile_grid,
+                                        custom_isocam_property.base_tile_width_px)
 
         elif custom_isocam_property.list_isocam == "ITEM_4":
             bpy.ops.mesh.primitive_plane_add(location=(0, 0, 0)) # Create Camera. I would love to set the scale here too. Blender not. So let's do it in an extra step
@@ -106,6 +302,59 @@ class PR_OT_createisocams(Operator):
             object.scale = (5, 5, 0)#The plane object is created with a size of 2. Scaling it to 10 means to scale it by factor 5
             bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)# apply scale
 
+        return {"FINISHED"}
+
+class PR_OT_frameisocamselection(Operator):
+    """Recenter the scene camera on the current selection and set the render resolution to match the Units per Pixel setting"""
+    bl_label = "Frame Selection"
+    bl_idname = "scene.frame_isocam_selection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT' or context.scene.camera is None:
+            return False
+        return any(obj.type not in {'CAMERA', 'LIGHT'} for obj in context.selected_objects)
+
+    def execute(self, context):
+        custom_isocam_property = context.scene.custom_isocam
+        target_objects = [obj for obj in context.selected_objects
+                           if obj.type not in {'CAMERA', 'LIGHT'}]
+        camera = context.scene.camera
+        if not frame_camera_on_objects(camera, target_objects, custom_isocam_property.pixel_density,
+                                        custom_isocam_property.use_tile_grid,
+                                        custom_isocam_property.base_tile_width_px):
+            self.report({'WARNING'}, "Selected objects have no bounding box to frame")
+            return {'CANCELLED'}
+        return {"FINISHED"}
+
+class PR_OT_setisocamscale(Operator):
+    """Set Units per Pixel so the selected object's footprint equals Base Tile Width"""
+    bl_label = "Set Scale From Selection"
+    bl_idname = "scene.set_isocam_scale"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT':
+            return False
+        return any(obj.type not in {'CAMERA', 'LIGHT'} for obj in context.selected_objects)
+
+    def execute(self, context):
+        custom_isocam_property = context.scene.custom_isocam
+        target_objects = [obj for obj in context.selected_objects
+                           if obj.type not in {'CAMERA', 'LIGHT'}]
+        rotation = _current_rotation(context)
+        if rotation is None:
+            self.report({'WARNING'}, "No camera and no camera preset selected to calibrate against")
+            return {'CANCELLED'}
+        right, up, forward = _view_axes(rotation)
+        bounds = _bounds_along_axes(target_objects, right, up, forward)
+        if bounds is None:
+            self.report({'WARNING'}, "Selected objects have no bounding box to measure")
+            return {'CANCELLED'}
+        _, width, _, _ = bounds
+        custom_isocam_property.pixel_density = width / custom_isocam_property.base_tile_width_px
         return {"FINISHED"}
 
 class PR_PT_createisocampanel(Panel):
@@ -131,6 +380,21 @@ class PR_PT_createisocampanel(Panel):
         col.scale_x = 1.6
         col.scale_y = 1.6
         col.prop(custom_pg, "list_isocam")
+
+        col = layout.column(align=False)
+        col.prop(custom_pg, "pixel_density")
+        col.operator("scene.set_isocam_scale")
+        col.prop(custom_pg, "use_tile_grid")
+        sub = col.column()
+        sub.enabled = custom_pg.use_tile_grid
+        sub.prop(custom_pg, "base_tile_width_px")
+        if custom_pg.use_tile_grid:
+            rotation = ISOCAM_ROTATIONS.get(custom_pg.list_isocam)
+            if rotation:
+                tile_height = _tile_height_px(rotation, custom_pg.pixel_density,
+                                               custom_pg.base_tile_width_px)
+                sub.label(text="Tile Height (derived): %dpx" % tile_height)
+        col.operator("scene.frame_isocam_selection")
 
         col = layout.column(align=False)
         addon_updater_ops.check_for_update_background()
@@ -202,19 +466,20 @@ class CreateIsocamPreferences(bpy.types.AddonPreferences):
 
 
 
-classes = (PR_GT_listofisocam, PR_OT_createisocams, PR_PT_createisocampanel, CreateIsocamPreferences)
+classes = (PR_GT_listofisocam, PR_OT_createisocams, PR_OT_frameisocamselection, PR_OT_setisocamscale,
+           PR_PT_createisocampanel, CreateIsocamPreferences)
 
 def register():
     addon_updater_ops.register(bl_info)
     for cls in classes:
         bpy.utils.register_class(cls)
-        bpy.types.Scene.custom_isocam = bpy.props.PointerProperty(type= PR_GT_listofisocam)
+    bpy.types.Scene.custom_isocam = bpy.props.PointerProperty(type= PR_GT_listofisocam)
 
 def unregister():
     addon_updater_ops.unregister()
     for cls in classes:
         bpy.utils.unregister_class(cls)
-        del bpy.types.Scene.custom_isocam
+    del bpy.types.Scene.custom_isocam
 
 if __name__ == "__main__":
     register()
