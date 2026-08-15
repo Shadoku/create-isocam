@@ -107,8 +107,8 @@ def _current_rotation(context):
 
 def _selection_bounds_in_view(camera, objects):
     """Same as _bounds_along_axes, but derives axes from a live camera
-    object, and also returns forward (frame_camera_on_objects needs it to
-    place the camera)."""
+    object, and also returns forward/up (frame_camera_on_objects needs
+    forward to place the camera and up to anchor tile-snapped height)."""
     basis = camera.matrix_world.to_3x3()
     right = (basis @ Vector((1, 0, 0))).normalized()
     up = (basis @ Vector((0, 1, 0))).normalized()
@@ -118,7 +118,7 @@ def _selection_bounds_in_view(camera, objects):
     if bounds is None:
         return None
     center, width, height, depth = bounds
-    return center, width, height, depth, forward
+    return center, width, height, depth, forward, up
 
 
 def frame_camera_on_objects(camera, objects, units_per_pixel, use_tile_grid=False,
@@ -126,31 +126,45 @@ def frame_camera_on_objects(camera, objects, units_per_pixel, use_tile_grid=Fals
     """Center camera on objects and set render resolution so that
     units_per_pixel Blender units always equal one output pixel.
 
-    When use_tile_grid is True, the render width is snapped up to the next
-    whole multiple of one tile's *projected* width (base_tile_width_px *
-    units_per_pixel, already in the same right-axis-projected world units
-    that _selection_bounds_in_view returns) instead of tightly fitting the
-    selection, so that assets with matching footprints render at compatible
-    widths and the footprint is never narrower than the canvas. Height is
-    never snapped, so taller objects simply get a taller canvas above the
-    same footprint.
+    When use_tile_grid is True, both the render width and height are
+    snapped up to the next whole multiple of one tile's *projected* size
+    (base_tile_width_px/tile_height_px * units_per_pixel, already in the
+    same axis-projected world units that _selection_bounds_in_view
+    returns) instead of tightly fitting the selection, so that assets with
+    matching footprints render at compatible sizes and the footprint is
+    never larger than the canvas. Width stays centered on the selection;
+    height snaps upward only, anchoring the object's bottom edge to the
+    bottom row of the frame so multiple different-height tiles share one
+    ground line.
     """
     bounds = _selection_bounds_in_view(camera, objects)
     if bounds is None:
         return False
-    center, width, height, depth, forward = bounds
-    height *= margin
+    center, width, height, depth, forward, up = bounds
 
     if use_tile_grid:
         tile_width_units = base_tile_width_px * units_per_pixel
         # Ceiling, not nearest: the snapped canvas must never be narrower
         # than the actual footprint, or the object clips left/right.
         tiles_wide = max(1, math.ceil(width / tile_width_units))
-        width = tiles_wide * tile_width_units
+        new_width = tiles_wide * tile_width_units
         resolution_x = tiles_wide * base_tile_width_px
+
+        tile_height_px = _tile_height_px(camera.rotation_euler, units_per_pixel, base_tile_width_px)
+        tile_height_units = tile_height_px * units_per_pixel
+        tiles_tall = max(1, math.ceil(height / tile_height_units))
+        new_height = tiles_tall * tile_height_units
+        resolution_y = tiles_tall * tile_height_px
+
+        # All headroom added by the vertical snap goes above the object,
+        # none below: shift the frame center up by half the added height.
+        center = center + up * ((new_height - height) / 2)
+        width, height = new_width, new_height
     else:
         width *= margin
+        height *= margin
         resolution_x = max(1, round(width / units_per_pixel))
+        resolution_y = max(1, round(height / units_per_pixel))
 
     distance = depth / 2 + max(width, height, 1.0)
     camera.location = center - forward * distance
@@ -167,7 +181,7 @@ def frame_camera_on_objects(camera, objects, units_per_pixel, use_tile_grid=Fals
 
     render = bpy.context.scene.render
     render.resolution_x = resolution_x
-    render.resolution_y = max(1, round(height / units_per_pixel))
+    render.resolution_y = resolution_y
     render.pixel_aspect_x = 1.0
     render.pixel_aspect_y = 1.0
     return True
