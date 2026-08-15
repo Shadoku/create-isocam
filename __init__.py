@@ -104,11 +104,12 @@ def frame_camera_on_objects(camera, objects, units_per_pixel, use_tile_grid=Fals
     units_per_pixel Blender units always equal one output pixel.
 
     When use_tile_grid is True, the render width is snapped to the nearest
-    whole multiple of base_tile_width_px (in world units, via
-    _tile_world_size) instead of tightly fitting the selection, so that
-    assets with matching footprints render at compatible widths. Height is
-    never snapped, so taller objects simply get a taller canvas above the
-    same footprint.
+    whole multiple of one tile's *projected* width (base_tile_width_px *
+    units_per_pixel, already in the same right-axis-projected world units
+    that _selection_bounds_in_view returns) instead of tightly fitting the
+    selection, so that assets with matching footprints render at compatible
+    widths. Height is never snapped, so taller objects simply get a taller
+    canvas above the same footprint.
     """
     bounds = _selection_bounds_in_view(camera, objects)
     if bounds is None:
@@ -117,9 +118,9 @@ def frame_camera_on_objects(camera, objects, units_per_pixel, use_tile_grid=Fals
     height *= margin
 
     if use_tile_grid:
-        tile_size = _tile_world_size(camera.rotation_euler, units_per_pixel, base_tile_width_px)
-        tiles_wide = max(1, round(width / tile_size))
-        width = tiles_wide * tile_size
+        tile_width_units = base_tile_width_px * units_per_pixel
+        tiles_wide = max(1, round(width / tile_width_units))
+        width = tiles_wide * tile_width_units
         resolution_x = tiles_wide * base_tile_width_px
     else:
         width *= margin
